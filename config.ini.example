@@ -1,0 +1,13 @@
+[rbdclamscan]
+proxmox_host = proxmox.example.com
+proxmox_user = scanner@pve
+proxmox_token_name = clamscan
+proxmox_token_value = xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+ceph_user = admin
+report_dir = /var/log/rbdclamscan/reports
+snapshot_name = clamscan
+
+# Optional filters (comma-separated)
+# include_vmids = 100,101,102
+# exclude_vmids = 999
+# include_nodes = pve1,pve2
