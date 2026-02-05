@@ -200,10 +200,38 @@ class RBDManager:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             device = result.stdout.strip()
             logger.info(f"Mapped {pool}/{image}@{snapshot} to {device}")
+
+            # Probe for partitions after mapping
+            self._probe_partitions(device)
+
             yield device
         finally:
             if device:
                 self._unmap(device)
+
+    def _probe_partitions(self, device: str):
+        """Probe device for partitions."""
+        # Try partprobe first
+        try:
+            cmd = ["partprobe", device]
+            logger.debug(f"Running: {' '.join(cmd)}")
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            # Fall back to blockdev --rereadpt
+            try:
+                cmd = ["blockdev", "--rereadpt", device]
+                logger.debug(f"Running: {' '.join(cmd)}")
+                subprocess.run(cmd, capture_output=True, text=True, check=False)
+            except FileNotFoundError:
+                pass
+
+        # Wait for udev to settle
+        try:
+            cmd = ["udevadm", "settle", "--timeout=5"]
+            logger.debug(f"Running: {' '.join(cmd)}")
+            subprocess.run(cmd, capture_output=True, text=True, check=False)
+        except FileNotFoundError:
+            time.sleep(1)  # Fallback if udevadm not available
 
     def _unmap(self, device: str):
         """Unmap RBD device."""
@@ -239,15 +267,20 @@ class PartitionDiscovery:
                             "size": child.get("size"),
                         }
                     )
-            # If no children, the device itself might be a filesystem
-            if not dev.get("children") and dev.get("fstype"):
-                partitions.append(
-                    {
-                        "device": device,
-                        "fstype": dev.get("fstype"),
-                        "size": dev.get("size"),
-                    }
-                )
+            # If no children, check if device itself has a filesystem or is LVM
+            if not dev.get("children"):
+                fstype = dev.get("fstype")
+                # If lsblk didn't detect fstype, try blkid
+                if not fstype:
+                    fstype = self.get_filesystem_type(device)
+                if fstype:
+                    partitions.append(
+                        {
+                            "device": device,
+                            "fstype": fstype,
+                            "size": dev.get("size"),
+                        }
+                    )
 
         return partitions
 
@@ -271,42 +304,101 @@ class LVMManager:
     def scan_and_activate(self, device: str):
         """Scan for PVs and activate VGs, yield LV paths."""
         vg_name = None
+        vg_uuid = None
         try:
             # Scan for physical volumes
             cmd = ["pvscan", "--cache", device]
             logger.debug(f"Running: {' '.join(cmd)}")
             subprocess.run(cmd, capture_output=True, text=True, check=True)
 
-            # Get VG name
-            cmd = ["pvs", "--noheadings", "-o", "vg_name", device]
+            # Get VG name and UUID from the device
+            cmd = ["pvs", "--noheadings", "-o", "vg_name,vg_uuid", device]
             logger.debug(f"Running: {' '.join(cmd)}")
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            vg_name = result.stdout.strip()
+            output = result.stdout.strip()
+
+            if not output:
+                logger.debug(f"No VG found on {device}")
+                yield []
+                return
+
+            parts = output.split()
+            if len(parts) >= 2:
+                vg_name = parts[0]
+                vg_uuid = parts[1]
+            elif len(parts) == 1:
+                vg_name = parts[0]
 
             if not vg_name:
                 logger.debug(f"No VG found on {device}")
                 yield []
                 return
 
-            # Activate VG
-            cmd = ["vgchange", "-ay", vg_name]
+            logger.debug(f"Found VG {vg_name} (UUID: {vg_uuid}) on {device}")
+
+            # Check if VG is already active (name conflict with host)
+            # Use vgchange with --select to target by UUID if available
+            if vg_uuid:
+                cmd = ["vgchange", "-ay", "--select", f"vg_uuid={vg_uuid}"]
+            else:
+                cmd = ["vgchange", "-ay", vg_name]
+
             logger.debug(f"Running: {' '.join(cmd)}")
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.warning(f"vgchange failed: {result.stderr}, trying with --partial")
+                # Try with --partial for incomplete VGs (common with snapshots)
+                if vg_uuid:
+                    cmd = ["vgchange", "-ay", "--partial", "--select", f"vg_uuid={vg_uuid}"]
+                else:
+                    cmd = ["vgchange", "-ay", "--partial", vg_name]
+                logger.debug(f"Running: {' '.join(cmd)}")
+                subprocess.run(cmd, capture_output=True, text=True, check=True)
+
             self.activated_vgs.append(vg_name)
             logger.info(f"Activated VG {vg_name}")
 
-            # List LVs
-            cmd = ["lvs", "--noheadings", "-o", "lv_path", vg_name]
+            # Wait for device nodes to be created
+            self._wait_for_udev()
+
+            # List LVs - use select by UUID if available for accuracy
+            if vg_uuid:
+                cmd = ["lvs", "--noheadings", "-o", "lv_path", "--select", f"vg_uuid={vg_uuid}"]
+            else:
+                cmd = ["lvs", "--noheadings", "-o", "lv_path", vg_name]
             logger.debug(f"Running: {' '.join(cmd)}")
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             lv_paths = [p.strip() for p in result.stdout.strip().split("\n") if p.strip()]
             logger.info(f"Found LVs: {lv_paths}")
 
-            yield lv_paths
+            # Verify LV device nodes exist
+            valid_lv_paths = []
+            for lv_path in lv_paths:
+                if os.path.exists(lv_path):
+                    valid_lv_paths.append(lv_path)
+                else:
+                    # Try to find via /dev/mapper
+                    mapper_name = lv_path.replace("/dev/", "").replace("/", "-")
+                    mapper_path = f"/dev/mapper/{mapper_name}"
+                    if os.path.exists(mapper_path):
+                        valid_lv_paths.append(mapper_path)
+                    else:
+                        logger.warning(f"LV device node not found: {lv_path}")
+
+            yield valid_lv_paths
 
         finally:
             if vg_name and vg_name in self.activated_vgs:
                 self._deactivate_vg(vg_name)
+
+    def _wait_for_udev(self):
+        """Wait for udev to create device nodes."""
+        try:
+            cmd = ["udevadm", "settle", "--timeout=5"]
+            logger.debug(f"Running: {' '.join(cmd)}")
+            subprocess.run(cmd, capture_output=True, text=True, check=False)
+        except FileNotFoundError:
+            time.sleep(1)
 
     def _deactivate_vg(self, vg_name: str):
         """Deactivate a VG."""

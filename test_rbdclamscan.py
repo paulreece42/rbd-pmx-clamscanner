@@ -336,6 +336,48 @@ class TestRBDManager:
             )
             assert unmap_call in mock_run.call_args_list
 
+    def test_map_snapshot_probes_partitions(self):
+        """Test that partition probing happens after mapping."""
+        manager = RBDManager("admin")
+        mock_result = mock.Mock()
+        mock_result.stdout = "/dev/rbd0\n"
+
+        with mock.patch("subprocess.run", return_value=mock_result) as mock_run:
+            with manager.map_snapshot("pool", "image", "snap"):
+                # Verify partprobe was called
+                partprobe_call = mock.call(
+                    ["partprobe", "/dev/rbd0"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                assert partprobe_call in mock_run.call_args_list
+
+    def test_map_snapshot_fallback_to_blockdev(self):
+        """Test fallback to blockdev when partprobe fails."""
+        manager = RBDManager("admin")
+        mock_result = mock.Mock()
+        mock_result.stdout = "/dev/rbd0\n"
+
+        call_count = [0]
+
+        def run_side_effect(cmd, **kwargs):
+            call_count[0] += 1
+            if cmd[0] == "partprobe":
+                raise subprocess.CalledProcessError(1, cmd)
+            return mock_result
+
+        with mock.patch("subprocess.run", side_effect=run_side_effect) as mock_run:
+            with manager.map_snapshot("pool", "image", "snap"):
+                # Verify blockdev --rereadpt was called after partprobe failed
+                blockdev_call = mock.call(
+                    ["blockdev", "--rereadpt", "/dev/rbd0"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                assert blockdev_call in mock_run.call_args_list
+
     def test_map_snapshot_cleanup_on_exception(self):
         """Test RBD unmap happens even on exception."""
         manager = RBDManager("admin")
@@ -474,7 +516,7 @@ class TestPartitionDiscovery:
         assert partitions[0]["fstype"] == "ext4"
 
     def test_discover_partitions_empty(self):
-        """Test device with no filesystems."""
+        """Test device with no filesystems detected by lsblk or blkid."""
         discovery = PartitionDiscovery()
         lsblk_output = json.dumps(
             {
@@ -489,13 +531,53 @@ class TestPartitionDiscovery:
                 ]
             }
         )
-        mock_result = mock.Mock()
-        mock_result.stdout = lsblk_output
 
-        with mock.patch("subprocess.run", return_value=mock_result):
+        def run_side_effect(cmd, **kwargs):
+            result = mock.Mock()
+            if cmd[0] == "lsblk":
+                result.stdout = lsblk_output
+            elif cmd[0] == "blkid":
+                result.returncode = 2  # blkid returns 2 when no fs found
+                result.stdout = ""
+            return result
+
+        with mock.patch("subprocess.run", side_effect=run_side_effect):
             partitions = discovery.discover_partitions("/dev/rbd0")
 
         assert len(partitions) == 0
+
+    def test_discover_partitions_lvm_whole_disk(self):
+        """Test device with LVM on whole disk (no partition table)."""
+        discovery = PartitionDiscovery()
+        lsblk_output = json.dumps(
+            {
+                "blockdevices": [
+                    {
+                        "name": "rbd0",
+                        "type": "disk",
+                        "fstype": None,  # lsblk might not detect LVM
+                        "size": "32G",
+                        "mountpoint": None,
+                    }
+                ]
+            }
+        )
+
+        def run_side_effect(cmd, **kwargs):
+            result = mock.Mock()
+            if cmd[0] == "lsblk":
+                result.stdout = lsblk_output
+            elif cmd[0] == "blkid":
+                result.returncode = 0
+                result.stdout = "LVM2_member\n"  # blkid detects LVM
+            return result
+
+        with mock.patch("subprocess.run", side_effect=run_side_effect):
+            partitions = discovery.discover_partitions("/dev/rbd0")
+
+        assert len(partitions) == 1
+        assert partitions[0]["device"] == "/dev/rbd0"
+        assert partitions[0]["fstype"] == "LVM2_member"
 
     def test_get_filesystem_type_success(self):
         """Test getting filesystem type."""
@@ -536,17 +618,20 @@ class TestLVMManager:
             result = mock.Mock()
             result.returncode = 0
             if cmd[0] == "pvs":
-                result.stdout = "  myvg\n"
+                result.stdout = "  myvg abc-123-uuid\n"
             elif cmd[0] == "lvs":
                 result.stdout = "  /dev/myvg/root\n  /dev/myvg/swap\n"
+            elif cmd[0] == "udevadm":
+                result.stdout = ""
             else:
                 result.stdout = ""
             return result
 
         with mock.patch("subprocess.run", side_effect=run_side_effect) as mock_run:
-            with manager.scan_and_activate("/dev/rbd0p2") as lv_paths:
-                assert lv_paths == ["/dev/myvg/root", "/dev/myvg/swap"]
-                assert "myvg" in manager.activated_vgs
+            with mock.patch("os.path.exists", return_value=True):
+                with manager.scan_and_activate("/dev/rbd0p2") as lv_paths:
+                    assert lv_paths == ["/dev/myvg/root", "/dev/myvg/swap"]
+                    assert "myvg" in manager.activated_vgs
 
             # Verify deactivation
             deactivate_call = mock.call(
@@ -556,6 +641,61 @@ class TestLVMManager:
                 check=True,
             )
             assert deactivate_call in mock_run.call_args_list
+
+    def test_scan_and_activate_with_uuid(self):
+        """Test LVM activation uses VG UUID when available."""
+        manager = LVMManager()
+
+        def run_side_effect(cmd, **kwargs):
+            result = mock.Mock()
+            result.returncode = 0
+            if cmd[0] == "pvs":
+                result.stdout = "  myvg abc-123-uuid\n"
+            elif cmd[0] == "vgchange" and "--select" in cmd:
+                # Verify UUID-based selection
+                assert "vg_uuid=abc-123-uuid" in cmd
+                result.stdout = ""
+            elif cmd[0] == "lvs" and "--select" in cmd:
+                assert "vg_uuid=abc-123-uuid" in cmd
+                result.stdout = "  /dev/myvg/root\n"
+            else:
+                result.stdout = ""
+            return result
+
+        with mock.patch("subprocess.run", side_effect=run_side_effect):
+            with mock.patch("os.path.exists", return_value=True):
+                with manager.scan_and_activate("/dev/rbd0p2") as lv_paths:
+                    assert lv_paths == ["/dev/myvg/root"]
+
+    def test_scan_and_activate_partial_vg(self):
+        """Test activation with --partial when regular activation fails."""
+        manager = LVMManager()
+        call_count = [0]
+
+        def run_side_effect(cmd, **kwargs):
+            result = mock.Mock()
+            result.returncode = 0
+            if cmd[0] == "pvs":
+                result.stdout = "  myvg abc-uuid\n"
+            elif cmd[0] == "vgchange" and "-ay" in cmd:
+                if "--partial" not in cmd:
+                    # First attempt fails
+                    result.returncode = 5
+                    result.stderr = "VG is partial"
+                else:
+                    # Second attempt with --partial succeeds
+                    result.returncode = 0
+                    result.stdout = ""
+            elif cmd[0] == "lvs":
+                result.stdout = "  /dev/myvg/root\n"
+            else:
+                result.stdout = ""
+            return result
+
+        with mock.patch("subprocess.run", side_effect=run_side_effect):
+            with mock.patch("os.path.exists", return_value=True):
+                with manager.scan_and_activate("/dev/rbd0p2") as lv_paths:
+                    assert lv_paths == ["/dev/myvg/root"]
 
     def test_scan_and_activate_no_vg(self):
         """Test when no VG found on device."""
@@ -573,6 +713,30 @@ class TestLVMManager:
         with mock.patch("subprocess.run", side_effect=run_side_effect):
             with manager.scan_and_activate("/dev/rbd0p2") as lv_paths:
                 assert lv_paths == []
+
+    def test_scan_and_activate_lv_device_node_fallback(self):
+        """Test fallback to /dev/mapper when LV path doesn't exist."""
+        manager = LVMManager()
+
+        def run_side_effect(cmd, **kwargs):
+            result = mock.Mock()
+            result.returncode = 0
+            if cmd[0] == "pvs":
+                result.stdout = "  myvg uuid123\n"
+            elif cmd[0] == "lvs":
+                result.stdout = "  /dev/myvg/root\n"
+            else:
+                result.stdout = ""
+            return result
+
+        def exists_side_effect(path):
+            # /dev/myvg/root doesn't exist, but /dev/mapper/myvg-root does
+            return path == "/dev/mapper/myvg-root"
+
+        with mock.patch("subprocess.run", side_effect=run_side_effect):
+            with mock.patch("os.path.exists", side_effect=exists_side_effect):
+                with manager.scan_and_activate("/dev/rbd0p2") as lv_paths:
+                    assert lv_paths == ["/dev/mapper/myvg-root"]
 
     def test_deactivate_vg_failure(self):
         """Test VG deactivation failure is logged."""
