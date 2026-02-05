@@ -714,6 +714,30 @@ class TestLVMManager:
             with manager.scan_and_activate("/dev/rbd0p2") as lv_paths:
                 assert lv_paths == []
 
+    def test_scan_and_activate_pvs_fails(self):
+        """Test when pvs command fails (device not a valid PV)."""
+        manager = LVMManager()
+
+        def run_side_effect(cmd, **kwargs):
+            result = mock.Mock()
+            result.stderr = ""
+            if cmd[0] == "pvscan":
+                result.returncode = 0
+                result.stdout = ""
+            elif cmd[0] == "pvs":
+                result.returncode = 5  # LVM error code
+                result.stdout = ""
+                result.stderr = "Device not found"
+            else:
+                result.returncode = 0
+                result.stdout = ""
+            return result
+
+        with mock.patch("subprocess.run", side_effect=run_side_effect):
+            # Should not raise, just return empty list
+            with manager.scan_and_activate("/dev/rbd0p5") as lv_paths:
+                assert lv_paths == []
+
     def test_scan_and_activate_lv_device_node_fallback(self):
         """Test fallback to /dev/mapper when LV path doesn't exist."""
         manager = LVMManager()

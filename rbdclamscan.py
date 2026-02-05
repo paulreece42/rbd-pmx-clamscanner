@@ -309,12 +309,21 @@ class LVMManager:
             # Scan for physical volumes
             cmd = ["pvscan", "--cache", device]
             logger.debug(f"Running: {' '.join(cmd)}")
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.debug(f"pvscan failed on {device}: {result.stderr.strip()}")
+                # Continue anyway - pvs might still work
 
             # Get VG name and UUID from the device
             cmd = ["pvs", "--noheadings", "-o", "vg_name,vg_uuid", device]
             logger.debug(f"Running: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.debug(f"pvs failed on {device} (exit {result.returncode}): {result.stderr.strip()}")
+                logger.debug(f"Device {device} is not a valid LVM physical volume")
+                yield []
+                return
+
             output = result.stdout.strip()
 
             if not output:
