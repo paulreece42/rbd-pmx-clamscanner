@@ -806,6 +806,27 @@ class TestMountManager:
                     mount_call = mock_run.call_args_list[0]
                     assert "ro,noload,norecovery" in mount_call[0][0]
 
+    def test_mount_descriptive_path(self):
+        """Test mount path includes VM name and disk name."""
+        manager = MountManager()
+
+        with mock.patch("subprocess.run") as mock_run:
+            with mock.patch("os.makedirs"):
+                with mock.patch("random.randint", return_value=12345):
+                    with manager.mount("/dev/rbd0p1", "ext4", "webserver", "scsi0_rbd0p1") as mount_point:
+                        assert mount_point == "/tmp/rbdclamscan_webserver_scsi0_rbd0p1_12345"
+
+    def test_mount_sanitizes_vm_name(self):
+        """Test mount path sanitizes special characters in VM name."""
+        manager = MountManager()
+
+        with mock.patch("subprocess.run") as mock_run:
+            with mock.patch("os.makedirs"):
+                with mock.patch("random.randint", return_value=99999):
+                    with manager.mount("/dev/rbd0p1", "ext4", "web/server:test", "scsi0") as mount_point:
+                        # Special chars should be replaced with underscores
+                        assert mount_point == "/tmp/rbdclamscan_web_server_test_scsi0_99999"
+
     def test_mount_ntfs(self):
         """Test mounting NTFS filesystem."""
         manager = MountManager()

@@ -10,6 +10,7 @@ import configparser
 import json
 import logging
 import os
+import random
 import re
 import subprocess
 import sys
@@ -436,7 +437,7 @@ class MountManager:
         self.mount_points: list[str] = []
 
     @contextmanager
-    def mount(self, device: str, fstype: str):
+    def mount(self, device: str, fstype: str, vm_name: str = "", disk_name: str = ""):
         """Mount filesystem read-only, yield mount point."""
         if fstype in self.SKIP_FS:
             logger.debug(f"Skipping {fstype} filesystem on {device}")
@@ -450,8 +451,16 @@ class MountManager:
 
         mount_point = None
         try:
-            # Create temporary mount point
-            mount_point = f"/tmp/rbdclamscan_{os.getpid()}_{device.replace('/', '_')}"
+            # Create temporary mount point with descriptive name
+            # Format: /tmp/rbdclamscan_{vm_name}_{disk_name}_{random}
+            random_suffix = random.randint(10000, 99999)
+            if vm_name and disk_name:
+                # Sanitize names for filesystem path
+                safe_vm_name = re.sub(r'[^a-zA-Z0-9_-]', '_', vm_name)
+                safe_disk_name = re.sub(r'[^a-zA-Z0-9_-]', '_', disk_name)
+                mount_point = f"/tmp/rbdclamscan_{safe_vm_name}_{safe_disk_name}_{random_suffix}"
+            else:
+                mount_point = f"/tmp/rbdclamscan_{os.getpid()}_{device.replace('/', '_')}_{random_suffix}"
             os.makedirs(mount_point, exist_ok=True)
 
             # Build mount command based on filesystem type
@@ -615,7 +624,7 @@ class VMScanner:
             logger.debug(f"Skipping {device} (fstype: {fstype})")
             return
 
-        with self.mount.mount(device, fstype) as mount_point:
+        with self.mount.mount(device, fstype, vm_name, disk_name) as mount_point:
             if mount_point:
                 self.scanner.scan(mount_point, vm_name, disk_name)
 
