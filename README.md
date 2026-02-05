@@ -64,6 +64,20 @@ systemctl enable --now clamav-daemon
 systemctl enable --now clamd@scan
 ```
 
+Make sure lvm.conf isn't blocking RBD devices from being used for LVM:
+
+
+```
+        types = [ "rbd", 1024 ]
+```
+```
+devices {
+         # added by pve-manager to avoid scanning ZFS zvols and Ceph rbds
+         # global_filter=["r|/dev/zd.*|"]
+         global_filter=["r|/dev/zd.*|", "a|/dev/rbd.*|"]
+}
+```
+
 ## Configuration
 
 Configuration can be provided via CLI arguments, environment variables, or a config file. Priority order (highest to lowest):
