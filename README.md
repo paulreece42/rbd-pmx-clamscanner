@@ -27,6 +27,12 @@ apt install ceph-common clamav-daemon lvm2 ntfs-3g
 dnf install ceph-common clamav clamd lvm2 ntfs-3g
 ```
 
+Note: this requires uninstalling fuse and re-installing fuse3. Proxox devs say this is OK:
+https://forum.proxmox.com/threads/sshfs-installing-fuse3.95909/
+
+    > hi, this should be fine since the fuse/fuse3 package only contains the userspace tools to mount a fuse filesystem (which we do not use directly)
+
+
 Required system tools:
 - `rbd` - Ceph RBD client for mapping block devices
 - `clamdscan` - ClamAV daemon scanner
