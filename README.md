@@ -2,6 +2,8 @@
 
 A Python tool that scans Proxmox virtual machines for malware using ClamAV by mounting Ceph RBD snapshots. The scanner creates read-only snapshots of VM disks, maps them via RBD, and scans the filesystems without affecting running VMs.
 
+https://github.com/paulreece42/rbd-pmx-clamscanner
+
 ## Features
 
 - **Non-intrusive scanning**: Scans VMs via read-only snapshots without requiring VM shutdown
